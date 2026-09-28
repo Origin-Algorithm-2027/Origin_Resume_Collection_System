@@ -1,0 +1,23 @@
+.env
+test/.env.reply
+.venv/
+__pycache__/
+*.pyc
+resume_pipeline.db
+test/reply_state.json
+.msal_cache.json
+homework_pipeline.db
+homework_pipeline.db-*
+homework_pipeline.db.lock
+
+# 所有自定义数据库及其辅助文件、重建备份。
+*.db
+*.db-*
+*.db.lock
+*.sqlite
+*.sqlite3
+*-reimport-*.json
+# 根目录本地简历样本；合成测试附件请放在 test/ 下。
+/*.doc
+/*.docx
+/*.pdf

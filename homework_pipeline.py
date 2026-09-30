@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按服务器收件日期，将作业附件追加到简历多维表格的每周附件列。"""
+"""优先按主题和附件名的周次、再按收件日期，将作业追加到飞书每周附件列。"""
 from __future__ import annotations
 
 import argparse
@@ -15,6 +15,7 @@ import sqlite3
 import socket
 import ssl
 import time
+import unicodedata
 import zlib
 from datetime import date, datetime, timedelta, timezone
 from email import policy
@@ -34,6 +35,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s | %(levelname)s | %(message)s")
 EMAIL_PAGE_SIZE = int(os.getenv("EMAIL_PAGE_SIZE", "50"))
 FIELD_SENDER = os.getenv("FIELD_SENDER", "邮件发件人")
+FIELD_NAME = os.getenv("FIELD_NAME", "姓名")
 
 log = logging.getLogger("homework")
 
@@ -58,8 +60,8 @@ def excluded_attachment(filename: str) -> bool:
     return Path(filename.rstrip()).suffix.casefold() in EXCLUDED_EXTENSIONS
 
 
-def normalized_email(value: Any) -> str:
-    # 飞书多行文本有时以连续的富文本片段返回。
+def cell_text(value: Any) -> str:
+    """飞书文本列可能由连续的富文本片段组成。"""
     if isinstance(value, list):
         value = "".join(
             str(item.get("text", "")) if isinstance(item, dict) else str(item)
@@ -67,8 +69,58 @@ def normalized_email(value: Any) -> str:
         )
     elif isinstance(value, dict):
         value = value.get("text", "")
-    address = parseaddr(str(value or ""))[1].strip().casefold()
+    return str(value or "")
+
+
+def normalized_email(value: Any) -> str:
+    address = parseaddr(cell_text(value))[1].strip().casefold()
     return address if "@" in address else ""
+
+
+def normalized_title(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFKC", cell_text(value)).casefold().split())
+
+
+def name_index(records: list[dict[str, Any]]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for record in records:
+        name = normalized_title((record.get("fields") or {}).get(FIELD_NAME))
+        record_id = record.get("record_id")
+        if len(name) >= 2 and record_id:
+            targets = result.setdefault(name, [])
+            if record_id not in targets:
+                targets.append(record_id)
+    return result
+
+
+def title_has_name(title: str, name: str) -> bool:
+    """识别完整姓名；不将短姓名当成长姓名或英文单词的一部分。"""
+    for match in re.finditer(re.escape(name), title):
+        before, after = title[:match.start()], title[match.end():]
+        left_ok = not before or not before[-1].isalpha()
+        right_ok = not after or not after[0].isalpha()
+        # 兼容“姓名张三”“张三第1周作业”等常见连续中文标题。
+        left_ok = left_ok or bool(re.search(r"(?:姓名|提交人|作者)[:：]?$", before))
+        right_ok = right_ok or bool(re.match(
+            r"(?:同学|的)?(?:第[0-9一二三四五六七八九十]+周|作业|周报|练习|提交)", after,
+        ))
+        if left_ok and right_ok:
+            return True
+    return False
+
+
+def match_name_titles(titles: list[str], names: dict[str, list[str]]) -> tuple[list[str], str]:
+    """只接受所有标题共同指向的唯一姓名、唯一记录；冲突交给人工处理。"""
+    normalized = [normalized_title(title) for title in titles]
+    matches = [name for name in names if any(title_has_name(title, name) for title in normalized)]
+    if not matches:
+        return [], "邮箱及标题姓名均未匹配"
+    if len(matches) != 1:
+        return [], "标题中匹配到多个姓名：" + "、".join(sorted(matches))
+    name = matches[0]
+    if len(names[name]) != 1:
+        return [], f"姓名重名或对应多条记录：{name}"
+    return list(names[name]), f"标题姓名匹配：{name}"
 
 
 def week_number(received: datetime, start: date) -> int:
@@ -81,6 +133,46 @@ def week_number(received: datetime, start: date) -> int:
     # 保留原起始日期和状态库绑定，已完成邮件不重新计算或搬动。
     first_tuesday = start + timedelta(days=1 - start.weekday())
     return max(1, (received_date - first_tuesday).days // 7 + 1)
+
+
+def explicit_week(title: str) -> int | None:
+    """标题只明确指向一个正整数周次时返回结果，否则留给下一层依据。"""
+    text = normalized_title(title)
+    digits = "一二三四五六七八九"
+    chinese = {char: value for value, char in enumerate(digits, 1)}
+    chinese["十"] = 10
+    for value in range(11, 100):
+        tens, units = divmod(value, 10)
+        label = (digits[tens - 1] if tens > 1 else "") + "十"
+        if units:
+            label += digits[units - 1]
+        chinese[label] = value
+    weeks = set()
+    pattern = r"第\s*([0-9零〇一二三四五六七八九十百千两]+)\s*(?:周|次\s*作业)|(?<![a-z0-9])week\s*([0-9]+)(?![0-9a-z])"
+    for match in re.finditer(pattern, text):
+        number = match.group(1) or match.group(2)
+        # Week 1-2 / Week 1.5 等不应截取为第1周。
+        if match.group(2) and re.match(
+            r"\s*(?:[./~～\-–—、&,]|to\b|and\b|至|到|和|及)\s*(?:week\s*)?[0-9]",
+            text[match.end():],
+        ):
+            return None
+        value = int(number) if number.isascii() and number.isdigit() else chinese.get(number)
+        if value is None or value <= 0:
+            return None
+        weeks.add(value)
+    return next(iter(weeks)) if len(weeks) == 1 else None
+
+
+def attachment_week(subject: str, filename: str, received_week: int) -> tuple[int, str]:
+    subject_week = explicit_week(subject)
+    if subject_week is not None:
+        return subject_week, "邮件主题"
+    title = Path(re.split(r"[/\\]", filename)[-1]).stem
+    filename_week = explicit_week(title)
+    if filename_week is not None:
+        return filename_week, "附件文件名"
+    return received_week, "收件时间"
 
 
 def record_index(records: list[dict[str, Any]]) -> dict[str, list[str]]:
@@ -504,14 +596,19 @@ class HomeworkMailClient(ImapConnection):
 
     def raw_message(self, uid: str) -> bytes:
         # 不在 FETCH 中重连，避免 UIDVALIDITY 改变后按旧 UID 取错邮件。
-        return self.fetch_raw(uid)
+        cached = getattr(self, "_raw_cache", None)
+        if cached is not None and cached[0] is self.conn and cached[1] == uid:
+            return cached[2]
+        raw = self.fetch_raw(uid)
+        # 只保留当前一封，姓名匹配、上传或转发共用同一份原文。
+        self._raw_cache = (self.conn, uid, raw)
+        return raw
 
-    def attachment_parts(self, uid: str) -> Iterator[tuple[int, str, bytes]]:
-        message = BytesParser(policy=policy.default).parsebytes(self.raw_message(uid))
-
+    @staticmethod
+    def ordinary_parts(message: Message) -> Iterator[tuple[int, Message]]:
         def walk_parts(part: Message) -> Iterator[Message]:
             yield part
-            # .eml 作为一个完整附件保存，不再次上传其中的嵌套附件。
+            # 附加 .eml 的内部主题和文件名不作为外层作业的身份依据。
             if (part.is_multipart() and not part.get_filename()
                     and part.get_content_disposition() not in {"attachment", "inline"}):
                 for child in part.get_payload():
@@ -519,53 +616,80 @@ class HomeworkMailClient(ImapConnection):
 
         for index, part in enumerate(walk_parts(message)):
             disposition = part.get_content_disposition()
+            if disposition != "inline" and (disposition == "attachment" or part.get_filename()):
+                yield index, part
+
+    def matching_titles(self, uid: str) -> list[str]:
+        message = BytesParser(policy=policy.default).parsebytes(self.raw_message(uid))
+        titles = [str(message.get("Subject") or "")]
+        for _, part in self.ordinary_parts(message):
             filename = part.get_filename()
-            if disposition == "inline" or (disposition != "attachment" and not filename):
-                continue
+            if filename:
+                # 不使用目录名、正文、压缩包内文件或发件人显示名猜姓名。
+                titles.append(Path(re.split(r"[/\\]", filename)[-1]).stem)
+        return titles
+
+    def subject(self, uid: str) -> str:
+        message = BytesParser(policy=policy.default).parsebytes(self.raw_message(uid))
+        return str(message.get("Subject") or "")
+
+    def attachment_parts(self, uid: str) -> Iterator[tuple[int, str, bytes]]:
+        message = BytesParser(policy=policy.default).parsebytes(self.raw_message(uid))
+        for index, part in self.ordinary_parts(message):
+            filename = part.get_filename()
             content = part.get_payload(decode=True)
             if content is None and part.get_content_type() == "message/rfc822":
                 content = b"\r\n".join(child.as_bytes(policy=policy.SMTP) for child in part.get_payload())
             if content is None:
                 raise ValueError(f"无法解码附件：UID={uid} part={index}")
-            yield index, safe_filename(filename or f"attachment-{index}.bin"), content
+            basename = re.split(r"[/\\]", filename)[-1] if filename else f"attachment-{index}.bin"
+            yield index, safe_filename(basename), content
 
 
 def process_message(
     key: str, uid: str, week: int, targets: list[str],
     mail: HomeworkMailClient, feishu: HomeworkFeishuClient, db: HomeworkState,
 ) -> bool:
-    field = feishu.ensure_week(week)
     targets = db.targets(key, targets)
-    tokens = []
+    subject = mail.subject(uid)
+    groups: dict[int, list[tuple[int, str, bytes]]] = {}
     filtered = 0
     for part, filename, content in mail.attachment_parts(uid):
         if excluded_attachment(filename):
             filtered += 1
             log.warning("附件已滤除：UID=%s，文件=%s，原因=Word/PDF格式不收取", uid, filename)
             continue
-        digest = hashlib.sha256(content).hexdigest()
-        token = db.token(key, part, digest)
-        if token is None:
-            token = feishu.upload_attachment(filename, content)
-            db.save_token(key, part, digest, token)
-        tokens.append(token)
-    if not tokens:
+        target_week, source = attachment_week(subject, filename, week)
+        groups.setdefault(target_week, []).append((part, filename, content))
+        log.info("作业周次判定：UID=%s，附件=%s，第%d周，依据=%s", uid, filename, target_week, source)
+    if not groups:
         reason = "附件全部被滤除" if filtered else "无普通附件"
         db.status(key, "skipped", reason)
         log.warning("邮件未入库：UID=%s，原因=%s", uid, reason)
         return False
-    for record_id in targets:
-        if db.delivered(key, record_id, field):
-            continue
-        existing = feishu.record_fields(record_id).get(field) or []
-        if not isinstance(existing, list) or any(not isinstance(item, dict) or not item.get("file_token") for item in existing):
-            raise RuntimeError(f"记录 {record_id} 的 {field} 附件格式无效")
-        merged = list(dict.fromkeys([item["file_token"] for item in existing] + tokens))
-        if merged != [item["file_token"] for item in existing]:
-            feishu.update_record_fields(record_id, {field: [{"file_token": token} for token in merged]})
-        db.mark_delivery(key, record_id, field)
+    for target_week, parts in groups.items():
+        field = feishu.ensure_week(target_week)
+        tokens = []
+        for part, filename, content in parts:
+            digest = hashlib.sha256(content).hexdigest()
+            token = db.token(key, part, digest)
+            if token is None:
+                token = feishu.upload_attachment(filename, content)
+                db.save_token(key, part, digest, token)
+            tokens.append(token)
+        for record_id in targets:
+            if db.delivered(key, record_id, field):
+                continue
+            existing = feishu.record_fields(record_id).get(field) or []
+            if not isinstance(existing, list) or any(not isinstance(item, dict) or not item.get("file_token") for item in existing):
+                raise RuntimeError(f"记录 {record_id} 的 {field} 附件格式无效")
+            merged = list(dict.fromkeys([item["file_token"] for item in existing] + tokens))
+            if merged != [item["file_token"] for item in existing]:
+                feishu.update_record_fields(record_id, {field: [{"file_token": token} for token in merged]})
+            db.mark_delivery(key, record_id, field)
+        log.info("作业附件归档成功：UID=%s，%s，附件=%d，匹配记录=%d", uid, field, len(tokens), len(targets))
     db.status(key, "done")
-    log.info("作业入库成功：UID=%s，%s，附件=%d，匹配记录=%d", uid, field, len(tokens), len(targets))
+    log.info("作业入库成功：UID=%s，涉及周次=%s", uid, sorted(groups))
     return True
 
 
@@ -599,7 +723,9 @@ def ingest_once(mail: HomeworkMailClient, feishu: HomeworkFeishuClient, db: Home
             counters["skipped"] = len(uids)
             log.warning("邮件已跳过：首次启动不补收，共%d封", len(uids))
             return counters
-    index = record_index(feishu.list_records())
+    records = feishu.list_records()
+    index = record_index(records)
+    names = name_index(records)
     batch_size = max(1, EMAIL_PAGE_SIZE)
     for offset in range(0, len(uids), batch_size):
         for uid in uids[offset:offset + batch_size]:
@@ -615,10 +741,15 @@ def ingest_once(mail: HomeworkMailClient, feishu: HomeworkFeishuClient, db: Home
                     log.warning("邮件已滤除：UID=%s，原因=早于起始日期", uid)
                     continue
                 targets = db.saved_targets(key) or index.get(sender, [])
+                reason = "邮箱及标题姓名均未匹配"
+                if not targets and names:
+                    targets, reason = match_name_titles(mail.matching_titles(uid), names)
+                    if targets:
+                        log.info("邮箱未匹配，使用姓名兜底：UID=%s，%s，记录=%s", uid, reason, targets[0])
                 if not targets:
-                    db.status(key, "forward_only", "未匹配邮件发件人")
+                    db.status(key, "forward_only", reason)
                     counters["unmatched"] += 1
-                    log.warning("邮件无法入库：UID=%s，发件人=%s，原因=未匹配飞书记录", uid, sender or "空")
+                    log.warning("邮件无法入库：UID=%s，发件人=%s，原因=%s", uid, sender or "空", reason)
                     continue
                 success = process_message(key, uid, week, targets, mail, feishu, db)
                 counters["done" if success else "skipped"] += 1

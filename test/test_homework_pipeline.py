@@ -23,6 +23,9 @@ class FakeMail:
         self.sender = "student@example.com"
         self.received = datetime(2026, 9, 21, tzinfo=h.BEIJING)
         self.validity = "mailbox:1"
+        self.titles = []
+        self.title_reads = []
+        self.mail_subject = ""
 
     def scope(self):
         return self.validity
@@ -37,6 +40,13 @@ class FakeMail:
     def attachment_parts(self, uid):
         self.fetched.append(uid)
         return [(1, "代码.zip", b"archive"), (2, "answer.anything", b"answer")]
+
+    def matching_titles(self, uid):
+        self.title_reads.append(uid)
+        return self.titles
+
+    def subject(self, uid):
+        return self.mail_subject
 
 
 class FakeFeishu:
@@ -103,6 +113,118 @@ class HomeworkTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             h.week_number(datetime(2026, 9, 21), self.start)
 
+    def test_subject_week_overrides_conflicting_filenames_and_received_time(self):
+        self.mail.mail_subject = "张三-第2周补交"
+        self.mail.attachment_parts = Mock(return_value=[
+            (1, "第1周.zip", b"one"), (2, "代码.py", b"two"),
+        ])
+        with self.assertLogs(h.log, level="INFO") as logs:
+            self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.feishu.records["r1"]["第1周"], [{"file_token": "old"}])
+        self.assertEqual(len(self.feishu.records["r1"]["第2周"]), 2)
+        self.assertEqual(self.feishu.fields, [2])
+        self.assertIn("依据=邮件主题", "".join(logs.output))
+        self.db.close()
+        self.db = h.HomeworkState(self.path)
+        self.mail.mail_subject = "第3周"
+        self.assertEqual(self.run_cycle()["done"], 0)
+        self.assertEqual(len(self.feishu.uploads), 2)
+        self.assertNotIn("第3周", self.feishu.records["r1"])
+
+    def test_each_filename_week_and_unlabelled_attachment_use_separate_columns(self):
+        self.mail.mail_subject = "补交作业"
+        self.mail.attachment_parts = Mock(return_value=[
+            (1, "第二周.zip", b"two"), (2, "Week 3.py", b"three"), (3, "说明.txt", b"time"),
+            (4, "第2周补充.csv", b"two-more"),
+        ])
+        with self.assertLogs(h.log, level="INFO") as logs:
+            self.assertEqual(self.run_cycle()["done"], 1)
+        fields = self.feishu.records["r1"]
+        self.assertEqual(len(fields["第2周"]), 2)
+        self.assertEqual(len(fields["第3周"]), 1)
+        self.assertEqual(len(fields["第1周"]), 2)  # 既有附件 + 未注明周次的说明。
+        self.assertEqual(self.feishu.fields, [2, 3, 1])
+        self.assertEqual(len(self.feishu.updates), 6)  # 每个目标行、每周只更新一次。
+        self.assertIn("依据=附件文件名", "".join(logs.output))
+        self.assertIn("依据=收件时间", "".join(logs.output))
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 6)
+
+    def test_ambiguous_subject_falls_back_to_each_filename_then_time(self):
+        self.mail.mail_subject = "第1周、第2周补交"
+        self.mail.attachment_parts = Mock(return_value=[
+            (1, "第三周.zip", b"three"), (2, "第2周_第3周.zip", b"ambiguous"),
+        ])
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.feishu.fields, [3, 1])
+
+    def test_filtered_filename_week_does_not_affect_other_attachments(self):
+        self.mail.attachment_parts = Mock(return_value=[
+            (1, "第9周.PDF", b"pdf"), (2, "代码.zip", b"code"),
+        ])
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.feishu.fields, [1])
+        self.assertEqual(self.feishu.uploads, [("代码.zip", b"code")])
+
+    def test_week_label_does_not_override_start_date_filter(self):
+        self.mail.received = datetime(2026, 9, 20, tzinfo=h.BEIJING)
+        self.mail.mail_subject = "第2周"
+        self.assertEqual(self.run_cycle()["skipped"], 1)
+        self.assertEqual(self.feishu.uploads, [])
+        self.assertEqual(self.feishu.fields, [])
+
+    def test_tuesday_time_fallback_with_ambiguous_labels(self):
+        self.mail.received = datetime(2026, 9, 29, tzinfo=h.BEIJING)
+        self.mail.mail_subject = "Week 1 and 3"
+        self.mail.attachment_parts = Mock(return_value=[(1, "第1周第3周.zip", b"code")])
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.feishu.fields, [2])
+
+    def test_first_assignment_filename_overrides_second_week_received_time(self):
+        self.mail.received = datetime(2026, 9, 30, 18, 24, tzinfo=h.BEIJING)
+        self.mail.attachment_parts = Mock(return_value=[
+            (4, "机械-测试同学-第一次作业.zip", b"assignment"),
+        ])
+        with self.assertLogs(h.log, level="INFO") as logs:
+            self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.feishu.fields, [1])
+        self.assertNotIn("第2周", self.feishu.records["r1"])
+        self.assertIn("依据=附件文件名", "".join(logs.output))
+
+    def test_assignment_number_in_subject_still_wins_over_filename(self):
+        self.mail.mail_subject = "第二次作业"
+        self.mail.attachment_parts = Mock(return_value=[
+            (1, "第一次作业.zip", b"assignment"),
+        ])
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.feishu.fields, [2])
+
+    def test_cross_week_partial_failure_forwards_once_without_ingestion_retry(self):
+        self.mail.attachment_parts = Mock(return_value=[
+            (1, "第2周.zip", b"two"), (2, "第3周.zip", b"three"),
+        ])
+        original_update = self.feishu.update_record_fields
+        def fail_third_week(record_id, fields):
+            if "第3周" in fields:
+                raise RuntimeError("third week unavailable")
+            original_update(record_id, fields)
+        raw = EmailMessage()
+        raw["Subject"] = "补交"
+        raw.set_content("original")
+        self.mail.raw_message = Mock(return_value=raw.as_bytes())
+        forwarder = h.UnmatchedForwardClient.__new__(h.UnmatchedForwardClient)
+        forwarder.username = "sender@example.com"
+        forwarder.recipient = "reviewer@example.com"
+        forwarder.send = Mock()
+        with patch.object(self.feishu, "update_record_fields", side_effect=fail_third_week):
+            result = h.run_once(self.mail, self.feishu, self.db, self.start, forwarder=forwarder)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["forwarded"], 1)
+        self.assertEqual(len(self.feishu.records["r1"]["第2周"]), 1)
+        self.assertNotIn("第3周", self.feishu.records["r1"])
+        h.run_once(self.mail, self.feishu, self.db, self.start, forwarder=forwarder)
+        forwarder.send.assert_called_once()
+        self.assertEqual(len(self.feishu.uploads), 2)
+
     def test_backfill_all_messages_and_append_to_all_matching_rows(self):
         self.mail.count = 53
         result = self.run_cycle()
@@ -145,6 +267,65 @@ class HomeworkTest(unittest.TestCase):
         self.feishu.records["new"] = {h.FIELD_SENDER: "new@example.com"}
         self.assertEqual(self.run_cycle()["done"], 0)
         self.assertEqual(self.mail.headers, ["1"])
+
+    def test_name_fallback_matches_subject_or_attachment_title(self):
+        self.mail.sender = "new@example.com"
+        self.feishu.records["r1"][h.FIELD_NAME] = "张三"
+        self.mail.titles = ["第1周作业-张三", "代码"]
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual([rid for rid, _ in self.feishu.updates], ["r1"])
+        self.mail.count = 2
+        self.mail.titles = ["第二次作业", "算法组_张三_26010001"]
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.mail.title_reads, ["1", "2"])
+        self.assertNotIn("第1周", self.feishu.records["r2"])
+
+    def test_email_match_wins_without_reading_name_titles(self):
+        self.mail.titles = ["李四-作业"]
+        self.feishu.records["other"] = {h.FIELD_NAME: "李四"}
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.mail.title_reads, [])
+        self.assertEqual({rid for rid, _ in self.feishu.updates}, {"r1", "r2"})
+
+    def test_duplicate_names_require_forwarding_not_broadcast(self):
+        self.mail.sender = "unknown@example.com"
+        for fields in self.feishu.records.values():
+            fields[h.FIELD_NAME] = "张三"
+        self.mail.titles = ["张三-作业"]
+        with self.assertLogs(h.log, level="WARNING") as logs:
+            self.assertEqual(self.run_cycle()["unmatched"], 1)
+        self.assertIn("重名", "".join(logs.output))
+        self.assertEqual(self.feishu.uploads, [])
+        self.assertEqual(self.db.conn.execute("SELECT status FROM messages").fetchone()[0], "forward_only")
+
+    def test_conflicting_subject_and_filename_are_not_ingested(self):
+        self.mail.sender = "unknown@example.com"
+        self.feishu.records["r1"][h.FIELD_NAME] = "张三"
+        self.feishu.records["r2"][h.FIELD_NAME] = "李四"
+        self.mail.titles = ["张三-作业", "李四_代码"]
+        self.assertEqual(self.run_cycle()["unmatched"], 1)
+        self.assertEqual(self.feishu.uploads, [])
+        # 已转入人工处理后，后续修改姓名也不重新入库。
+        self.mail.titles = ["张三-作业"]
+        self.assertEqual(self.run_cycle()["done"], 0)
+        self.assertEqual(self.mail.title_reads, ["1"])
+
+    def test_saved_target_precedes_changed_name_and_email(self):
+        self.mail.sender = "unknown@example.com"
+        self.db.targets("mailbox:1:1", ["r1"])
+        self.mail.titles = ["李四-作业"]
+        self.feishu.records["r2"][h.FIELD_NAME] = "李四"
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.mail.title_reads, [])
+        self.assertEqual([rid for rid, _ in self.feishu.updates], ["r1"])
+
+    def test_name_match_still_filters_word_and_pdf(self):
+        self.mail.sender = "unknown@example.com"
+        self.mail.titles = ["张三-报名", "张三_报名表"]
+        self.feishu.records["r1"][h.FIELD_NAME] = "张三"
+        with patch.object(self.mail, "attachment_parts", return_value=[(1, "张三.pdf", b"pdf")]):
+            self.assertEqual(self.run_cycle()["skipped"], 1)
+        self.assertEqual(self.feishu.uploads, [])
 
     def test_skip_history_setting_and_uidvalidity_changes(self):
         self.assertEqual(self.run_cycle(False)["skipped"], 1)
@@ -291,6 +472,82 @@ class HomeworkTest(unittest.TestCase):
                     pass
         with h.instance_lock(self.path):
             pass
+
+
+class WeekTitleTest(unittest.TestCase):
+    def test_explicit_forms_and_repeated_equivalent_week(self):
+        for title, expected in [
+            ("第1周", 1), ("第一周作业", 1), ("第十二周", 12), ("第九十九周", 99),
+            ("第 ２ 周", 2), ("Week 2", 2), ("张三_WEEK3", 3), ("Ｗｅｅｋ　４", 4),
+            ("第2周_第二周_week02", 2), ("第7周", 7),
+            ("第一次作业", 1), ("第1次作业", 1), ("第 十二 次 作业", 12),
+            ("第２次作业", 2), ("第一周第一次作业", 1),
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(h.explicit_week(title), expected)
+
+    def test_ambiguous_or_non_week_numbers_are_not_used(self):
+        for title in ["第1周、第2周", "Week 1 / Week 2", "Week 1-2", "Week 1.5",
+                      "Week 1 and 2", "第1-2周", "第一、二周", "第0周", "week -1",
+                      "26013762", "2026-09-29", "第二次提交", "第1.5周", "weekend2", "",
+                      "第1周第二次作业", "第一次作业第二次作业", "第0次作业"]:
+            with self.subTest(title=title):
+                self.assertIsNone(h.explicit_week(title))
+
+    def test_filename_folder_is_not_week_evidence(self):
+        self.assertEqual(h.attachment_week("", r"第2周\代码.zip", 3), (3, "收件时间"))
+        self.assertEqual(h.attachment_week("第1周", "第二周.zip", 3), (1, "邮件主题"))
+
+
+class NameMatchingTest(unittest.TestCase):
+    def test_full_name_boundaries_and_common_chinese_titles(self):
+        for title in ("算法组_张三_26010001", "张三第1周作业", "姓名张三", "张三的作业"):
+            with self.subTest(title=title):
+                self.assertEqual(h.match_name_titles([title], {"张三": ["r1"]})[0], ["r1"])
+        for title in ("李张三-作业", "张三丰-作业", "代码", "Assignment"):
+            with self.subTest(title=title):
+                self.assertEqual(h.match_name_titles([title], {"张三": ["r1"], "ann": ["r2"]})[0], [])
+
+    def test_rich_text_configured_column_and_unicode_names(self):
+        with patch.object(h, "FIELD_NAME", "报名姓名"):
+            names = h.name_index([
+                {"record_id": "r1", "fields": {"报名姓名": [{"text": "张"}, {"text": "三"}]}},
+                {"record_id": "r2", "fields": {"报名姓名": {"text": "John  Smith"}}},
+                {"record_id": "r3", "fields": {"报名姓名": ""}},
+            ])
+        self.assertEqual(names, {"张三": ["r1"], "john smith": ["r2"]})
+        self.assertEqual(h.match_name_titles(["ＪＯＨＮ　ＳＭＩＴＨ_week1"], names)[0], ["r2"])
+
+    def test_multiple_mentions_of_same_person_are_allowed(self):
+        self.assertEqual(h.match_name_titles(["张三-作业", "张三_代码"], {"张三": ["r1"]})[0], ["r1"])
+
+    def test_longer_name_does_not_match_shorter_name(self):
+        self.assertEqual(h.match_name_titles(["张三丰-作业"], {"张三": ["r1"], "张三丰": ["r2"]})[0], ["r2"])
+
+    def test_mime_titles_and_upload_share_one_fetch(self):
+        msg = EmailMessage()
+        msg["Subject"] = "算法组-张三-第1周"
+        msg.set_content("李四：正文不能用于姓名匹配")
+        msg.add_attachment(b"zip", maintype="application", subtype="zip", filename="张三_代码.zip")
+        msg.add_attachment(b"img", maintype="image", subtype="png", filename="李四.png", disposition="inline")
+        nested = EmailMessage()
+        nested["Subject"] = "王五-作业"
+        nested.set_content("body")
+        nested.add_attachment(b"zip", maintype="application", subtype="zip", filename="王五.zip")
+        msg.add_attachment(nested, filename="参考.eml")
+        client = h.HomeworkMailClient.__new__(h.HomeworkMailClient)
+        client.conn = Mock()
+        client.conn.uid.return_value = ("OK", [(b"BODY[]", msg.as_bytes())])
+        self.assertEqual(client.matching_titles("1"), ["算法组-张三-第1周", "张三_代码", "参考"])
+        self.assertEqual(client.subject("1"), "算法组-张三-第1周")
+        self.assertEqual(len(list(client.attachment_parts("1"))), 2)
+        client.conn.uid.assert_called_once()
+        client.matching_titles("2")
+        self.assertEqual(client.conn.uid.call_count, 2)
+        client.conn = Mock()
+        client.conn.uid.return_value = ("OK", [(b"BODY[]", msg.as_bytes())])
+        client.matching_titles("2")
+        client.conn.uid.assert_called_once()
 
 
 class FeishuApiTest(unittest.TestCase):

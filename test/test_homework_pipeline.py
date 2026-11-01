@@ -9,7 +9,9 @@ from email.message import EmailMessage
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
+
+import requests
 
 import homework_pipeline as h
 import pipeline_common as common
@@ -157,13 +159,13 @@ class HomeworkTest(unittest.TestCase):
         self.assertEqual(self.run_cycle()["done"], 1)
         self.assertEqual(self.feishu.fields, [3, 1])
 
-    def test_filtered_filename_week_does_not_affect_other_attachments(self):
+    def test_pdf_filename_week_is_used_without_affecting_other_attachments(self):
         self.mail.attachment_parts = Mock(return_value=[
             (1, "第9周.PDF", b"pdf"), (2, "代码.zip", b"code"),
         ])
         self.assertEqual(self.run_cycle()["done"], 1)
-        self.assertEqual(self.feishu.fields, [1])
-        self.assertEqual(self.feishu.uploads, [("代码.zip", b"code")])
+        self.assertEqual(self.feishu.fields, [9, 1])
+        self.assertEqual(self.feishu.uploads, [("第9周.PDF", b"pdf"), ("代码.zip", b"code")])
 
     def test_week_label_does_not_override_start_date_filter(self):
         self.mail.received = datetime(2026, 9, 20, tzinfo=h.BEIJING)
@@ -319,13 +321,13 @@ class HomeworkTest(unittest.TestCase):
         self.assertEqual(self.mail.title_reads, [])
         self.assertEqual([rid for rid, _ in self.feishu.updates], ["r1"])
 
-    def test_name_match_still_filters_word_and_pdf(self):
+    def test_name_match_accepts_pdf(self):
         self.mail.sender = "unknown@example.com"
         self.mail.titles = ["张三-报名", "张三_报名表"]
         self.feishu.records["r1"][h.FIELD_NAME] = "张三"
         with patch.object(self.mail, "attachment_parts", return_value=[(1, "张三.pdf", b"pdf")]):
-            self.assertEqual(self.run_cycle()["skipped"], 1)
-        self.assertEqual(self.feishu.uploads, [])
+            self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.feishu.uploads, [("张三.pdf", b"pdf")])
 
     def test_skip_history_setting_and_uidvalidity_changes(self):
         self.assertEqual(self.run_cycle(False)["skipped"], 1)
@@ -389,37 +391,34 @@ class HomeworkTest(unittest.TestCase):
         self.run_cycle()
         self.mail.attachment_parts.assert_called_once()
 
-    def test_filters_word_pdf_case_insensitively_but_keeps_other_attachments(self):
+    def test_accepts_all_attachment_extensions(self):
+        filenames = ["报名.WORD", "报名.doc", "报名.DOCX", "报名.Pdf ", "作业.zip", "code.py", "无扩展名"]
         self.mail.attachment_parts = Mock(return_value=[
-            (i, name, b"content") for i, name in enumerate(
-                ["报名.WORD", "报名.doc", "报名.DOCX", "报名.Pdf ", "作业.zip", "code.py"])
+            (i, name, b"content") for i, name in enumerate(filenames)
         ])
-        with self.assertLogs(h.log, level="WARNING") as logs:
-            self.assertEqual(self.run_cycle()["done"], 1)
-        self.assertEqual(len(logs.output), 4)
-        self.assertEqual([item[0] for item in self.feishu.uploads], ["作业.zip", "code.py"])
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual([item[0] for item in self.feishu.uploads], filenames)
+        self.assertEqual(len(self.feishu.records["r1"]["第1周"]), len(filenames) + 1)
 
-    def test_all_filtered_mail_is_terminal_and_not_uploaded(self):
+    def test_pdf_only_mail_is_uploaded_once(self):
         self.mail.attachment_parts = Mock(return_value=[(1, "form.pdf", b"pdf")])
-        with self.assertLogs(h.log, level="WARNING") as logs:
-            self.assertEqual(self.run_cycle()["skipped"], 1)
-        self.assertIn("附件全部被滤除", " ".join(logs.output))
-        self.assertEqual(self.feishu.uploads, [])
-        self.assertEqual(self.feishu.updates, [])
+        self.assertEqual(self.run_cycle()["done"], 1)
+        self.assertEqual(self.feishu.uploads, [("form.pdf", b"pdf")])
+        self.assertEqual(len(self.feishu.updates), 2)
         self.run_cycle()
         self.mail.attachment_parts.assert_called_once()
+        self.assertEqual(len(self.feishu.uploads), 1)
 
     def test_reimport_removes_owned_tokens_only_and_reprocesses(self):
         self.mail.attachment_parts = Mock(return_value=[(1, "form.pdf", b"pdf"), (2, "code.zip", b"zip")])
-        with patch.object(h, "EXCLUDED_EXTENSIONS", set()):
-            self.run_cycle()
+        self.run_cycle()
         self.feishu.records["r1"]["原始简历"] = [{"file_token": "token1"}]
         h.prepare_reimport(self.feishu, self.db, self.path)
         self.assertEqual(self.feishu.records["r1"]["第1周"], [{"file_token": "old"}])
         self.assertEqual(self.feishu.records["r1"]["原始简历"], [{"file_token": "token1"}])
         self.assertTrue(list(Path(self.tmp.name).glob("*.json")))
         self.assertEqual(self.run_cycle()["done"], 1)
-        self.assertEqual(self.feishu.records["r1"]["第1周"], [{"file_token": "old"}, {"file_token": "token2"}])
+        self.assertEqual(self.feishu.records["r1"]["第1周"], [{"file_token": "old"}, {"file_token": "token1"}, {"file_token": "token2"}])
         self.assertEqual(len(self.feishu.uploads), 2)
 
     def test_interrupted_reimport_cleanup_can_resume_without_losing_state(self):
@@ -612,6 +611,61 @@ class FeishuApiTest(unittest.TestCase):
         self.assertEqual(calls[4].kwargs["json"], {"upload_id": "up", "block_num": 3})
         with self.assertRaises(ValueError):
             client.upload_attachment("empty", b"")
+
+    def test_transient_part_failure_retries_same_block_then_continues(self):
+        errors = [
+            requests.HTTPError("temporary", response=Mock(status_code=status))
+            for status in (408, 429, 500, 502, 503, 504)
+        ] + [requests.Timeout("timeout"), requests.ConnectionError("disconnected")]
+        for error in errors:
+            with self.subTest(error=error, response=getattr(error, "response", None)):
+                client = self.client()
+                client.api.side_effect = [
+                    {"upload_id": "up", "block_size": 3, "block_num": 3},
+                    {}, error, {}, {}, {"file_token": "large"},
+                ]
+                with patch.object(h, "SINGLE_UPLOAD_LIMIT", 4), patch.object(h.time, "sleep") as sleep:
+                    self.assertEqual(client.upload_attachment("test.zip", b"12345678"), "large")
+                calls = client.api.call_args_list
+                self.assertEqual(calls[2], calls[3])
+                self.assertEqual([c.kwargs["data"]["seq"] for c in calls[1:5]], ["0", "1", "1", "2"])
+                self.assertEqual(calls[-1].args[1], "drive/v1/medias/upload_finish")
+                sleep.assert_called_once_with(2)
+
+    def test_part_retry_exhaustion_preserves_error_and_does_not_finish(self):
+        client = self.client()
+        error = requests.HTTPError("Bad Gateway", response=requests.Response())
+        error.response.status_code = 502
+        client.api.side_effect = [
+            {"upload_id": "up", "block_size": 3, "block_num": 3},
+            error, error, error, error,
+        ]
+        with patch.object(h, "SINGLE_UPLOAD_LIMIT", 4), patch.object(h.time, "sleep") as sleep:
+            with self.assertRaises(requests.HTTPError) as caught:
+                client.upload_attachment("test.zip", b"12345678")
+        self.assertIs(caught.exception, error)
+        self.assertEqual(client.api.call_count, 5)
+        self.assertTrue(all(c == client.api.call_args_list[1] for c in client.api.call_args_list[1:]))
+        self.assertEqual(sleep.call_args_list, [call(2), call(4), call(8)])
+
+    def test_permanent_part_errors_are_not_retried(self):
+        errors = [
+            requests.HTTPError("rejected", response=Mock(status_code=status))
+            for status in (400, 401, 403, 404, 413)
+        ] + [requests.HTTPError("no response"), requests.exceptions.SSLError("certificate"),
+             RuntimeError("飞书接口失败：1061004 forbidden")]
+        for error in errors:
+            with self.subTest(error=error, response=getattr(error, "response", None)):
+                client = self.client()
+                client.api.side_effect = [
+                    {"upload_id": "up", "block_size": 3, "block_num": 3}, error,
+                ]
+                with patch.object(h, "SINGLE_UPLOAD_LIMIT", 4), patch.object(h.time, "sleep") as sleep:
+                    with self.assertRaises(type(error)) as caught:
+                        client.upload_attachment("test.zip", b"12345678")
+                self.assertIs(caught.exception, error)
+                self.assertEqual(client.api.call_count, 2)
+                sleep.assert_not_called()
 
     def test_api_permission_error_is_reported(self):
         client = self.client()
@@ -827,10 +881,10 @@ class UnmatchedForwardTest(unittest.TestCase):
         self.mail.raw_message.assert_not_called()
         self.forwarder.send.assert_not_called()
 
-    def test_matched_and_filtered_mail_is_not_forwarded(self):
+    def test_matched_pdf_mail_is_ingested_not_forwarded(self):
         self.mail.attachment_parts = Mock(return_value=[(1, "form.pdf", b"pdf")])
         result = h.run_once(self.mail, self.feishu, self.db, date(2026, 9, 21), forwarder=self.forwarder)
-        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["done"], 1)
         self.forwarder.send.assert_not_called()
 
     def test_reimport_preserves_sent_forward_receipts(self):
@@ -853,6 +907,34 @@ class UnmatchedForwardTest(unittest.TestCase):
             h.run_once(self.mail, self.feishu, self.db, date(2026, 9, 21), forwarder=self.forwarder)
         upload.assert_called_once()
         self.forwarder.send.assert_called_once()
+
+    def run_part_retry_cycle(self, recover):
+        client = h.HomeworkFeishuClient.__new__(h.HomeworkFeishuClient)
+        client.app_token = "test-app"
+        error = requests.HTTPError("Bad Gateway", response=Mock(status_code=502))
+        responses = [{"upload_id": "up", "block_size": 3, "block_num": 3}, error]
+        responses += [{}, {}, {}, {"file_token": "large"}] if recover else [error] * 3
+        client.api = Mock(side_effect=responses)
+        self.mail.attachment_parts = Mock(return_value=[(1, "test.zip", b"12345678")])
+        with patch.object(self.feishu, "upload_attachment", side_effect=client.upload_attachment):
+            with patch.object(h, "SINGLE_UPLOAD_LIMIT", 4), patch.object(h.time, "sleep"):
+                if recover:
+                    result = h.run_once(self.mail, self.feishu, self.db, date(2026, 9, 21), forwarder=self.forwarder)
+                    self.assertEqual(result["done"], 1)
+                    self.forwarder.send.assert_not_called()
+                else:
+                    with self.assertRaises(requests.HTTPError):
+                        h.run_once(self.mail, self.feishu, self.db, date(2026, 9, 21), forwarder=self.forwarder)
+                    self.assertEqual(client.api.call_count, 5)
+                    self.forwarder.send.assert_called_once()
+        status = self.db.conn.execute("SELECT status FROM messages WHERE key='mailbox:1:1'").fetchone()[0]
+        self.assertEqual(status, "done" if recover else "forwarded")
+
+    def test_part_retry_success_is_ingested_without_forwarding(self):
+        self.run_part_retry_cycle(recover=True)
+
+    def test_part_retry_exhaustion_forwards_failed_mail(self):
+        self.run_part_retry_cycle(recover=False)
 
     def test_forward_failure_retries_only_smtp_even_if_matching_row_added(self):
         self.mail.sender = "unknown@example.com"

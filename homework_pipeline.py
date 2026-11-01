@@ -25,6 +25,7 @@ from email.utils import parseaddr, format_datetime, make_msgid
 from pathlib import Path
 from typing import Any, Iterator
 
+import requests
 from dotenv import load_dotenv
 from pipeline_common import (
     FeishuTransport, ImapConnection, safe_filename, red_text, required_env, send_smtp, instance_lock,
@@ -52,12 +53,9 @@ log.addHandler(_handler)
 log.propagate = False
 BEIJING = timezone(timedelta(hours=8))
 SINGLE_UPLOAD_LIMIT = 20 * 1024 * 1024
+UPLOAD_PART_MAX_ATTEMPTS = 4
+UPLOAD_PART_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 HOMEWORK_POLL_INTERVAL_SECONDS = int(os.getenv("HOMEWORK_POLL_INTERVAL_SECONDS", "900"))
-EXCLUDED_EXTENSIONS = {".word", ".doc", ".docx", ".pdf"}
-
-
-def excluded_attachment(filename: str) -> bool:
-    return Path(filename.rstrip()).suffix.casefold() in EXCLUDED_EXTENSIONS
 
 
 def cell_text(value: Any) -> str:
@@ -473,7 +471,7 @@ def prepare_reimport(feishu: HomeworkFeishuClient, db: HomeworkState, db_path: s
             db.conn.execute(f"DELETE FROM {table}")
         db.conn.execute("DELETE FROM meta WHERE key NOT IN ('binding', 'reimport_phase')")
         db.conn.execute("UPDATE meta SET value='processing' WHERE key='reimport_phase'")
-    log.info("已移除旧作业附件引用%d个；开始按新过滤规则重新入库", removed)
+    log.info("已移除旧作业附件引用%d个；开始按当前归档规则重新入库", removed)
 
 
 class HomeworkFeishuClient(FeishuTransport):
@@ -509,6 +507,31 @@ class HomeworkFeishuClient(FeishuTransport):
         return name
 
 
+    def _upload_part(self, upload_id: str, seq: int, block: bytes) -> None:
+        """只重传失败分片，保持上传事务、序号及内容不变。"""
+        for attempt in range(1, UPLOAD_PART_MAX_ATTEMPTS + 1):
+            try:
+                self.api("POST", "drive/v1/medias/upload_part", data={
+                    "upload_id": upload_id, "seq": str(seq), "size": str(len(block)),
+                    "checksum": str(zlib.adler32(block) & 0xffffffff),
+                }, files={"file": ("chunk", block, "application/octet-stream")})
+                return
+            except requests.RequestException as exc:
+                if isinstance(exc, requests.HTTPError):
+                    retryable = (exc.response is not None
+                                 and exc.response.status_code in UPLOAD_PART_RETRY_STATUSES)
+                else:
+                    retryable = (isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                                 and not isinstance(exc, requests.exceptions.SSLError))
+                if not retryable or attempt == UPLOAD_PART_MAX_ATTEMPTS:
+                    raise
+                delay = 2 ** attempt
+                log.warning(
+                    "飞书分片上传临时失败：分片序号=%d，本次尝试=%d/%d，%d秒后重试：%s",
+                    seq, attempt, UPLOAD_PART_MAX_ATTEMPTS, delay, exc,
+                )
+                time.sleep(delay)
+
     def upload_attachment(self, filename: str, content: bytes) -> str:
         if not content:
             raise ValueError(f"无法上传空附件：{filename}")
@@ -525,10 +548,7 @@ class HomeworkFeishuClient(FeishuTransport):
             raise RuntimeError("飞书分片上传返回了无效的块大小或数量")
         for seq in range(block_num):
             block = content[seq * block_size:(seq + 1) * block_size]
-            self.api("POST", "drive/v1/medias/upload_part", data={
-                "upload_id": upload_id, "seq": str(seq), "size": str(len(block)),
-                "checksum": str(zlib.adler32(block) & 0xffffffff),
-            }, files={"file": ("chunk", block, "application/octet-stream")})
+            self._upload_part(upload_id, seq, block)
         result = self.api("POST", "drive/v1/medias/upload_finish", json={
             "upload_id": upload_id, "block_num": block_num,
         })
@@ -653,17 +673,12 @@ def process_message(
     targets = db.targets(key, targets)
     subject = mail.subject(uid)
     groups: dict[int, list[tuple[int, str, bytes]]] = {}
-    filtered = 0
     for part, filename, content in mail.attachment_parts(uid):
-        if excluded_attachment(filename):
-            filtered += 1
-            log.warning("附件已滤除：UID=%s，文件=%s，原因=Word/PDF格式不收取", uid, filename)
-            continue
         target_week, source = attachment_week(subject, filename, week)
         groups.setdefault(target_week, []).append((part, filename, content))
         log.info("作业周次判定：UID=%s，附件=%s，第%d周，依据=%s", uid, filename, target_week, source)
     if not groups:
-        reason = "附件全部被滤除" if filtered else "无普通附件"
+        reason = "无普通附件"
         db.status(key, "skipped", reason)
         log.warning("邮件未入库：UID=%s，原因=%s", uid, reason)
         return False
